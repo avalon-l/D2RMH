@@ -2,6 +2,8 @@
 
 #include "d2ptrs.h"
 
+namespace d2mapapi {
+
 static const unsigned int ActLevels[] = {1, 40, 75, 103, 109, 137};
 
 namespace Helpers {
@@ -29,7 +31,7 @@ bool Session::update(unsigned int seed, unsigned char difficulty) {
     return true;
 }
 
-CollisionMap *Session::getMap(unsigned int areaid) {
+const CollisionMap *Session::getMap(unsigned int areaid) {
     auto ite = maps_.find(areaid);
     if (ite == maps_.end()) {
         auto actId = Helpers::getAct(areaid);
@@ -40,8 +42,8 @@ CollisionMap *Session::getMap(unsigned int areaid) {
             acts_[actId] = D2COMMON_LoadAct(actId, seed_, 1 /*TRUE*/, nullptr, difficulty_, nullptr,
                                             ActLevels[actId], D2CLIENT_LoadAct_1, D2CLIENT_LoadAct_2);
         }
-        auto map = std::make_unique<CollisionMap>(acts_[actId], areaid);
-        if (!map->build()) { return nullptr; }
+        auto map = std::make_unique<MapData>(acts_[actId], areaid);
+        if (!map->built) { return nullptr; }
         auto &output = maps_[areaid];
         output = std::move(map);
         return output.get();
@@ -58,4 +60,6 @@ void Session::unloadAll() {
             act = nullptr;
         }
     }
+}
+
 }

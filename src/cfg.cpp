@@ -11,30 +11,44 @@
 #include "util.h"
 #include "ini.h"
 
+#include <fstream>
 #include <algorithm>
 #include <cstring>
+
+#if defined(_MSC_VER)
+#define strcasecmp _stricmp
+#endif
 
 static Cfg sCfg;
 const Cfg *cfg = &sCfg;
 
 #define LOADVAL(n, m) else if (!strcmp(name, #n)) { sCfg.m = value; }
 #define LOADVALW(n, m) else if (!strcmp(name, #n)) { sCfg.m = utf8toucs4(value); }
-#define LOADVALN(n, m) else if (!strcmp(name, #n)) { sCfg.m = strtoul(value, nullptr, 0); }
+#define LOADVALN(n, m) else if (!strcmp(name, #n)) { sCfg.m = decltype(sCfg.m)(strtol(value, nullptr, 0)); }
 #define LOADVALF(n, m) else if (!strcmp(name, #n)) { sCfg.m = strtof(value, nullptr); }
 #define LOADVALC(n, m) else if (!strcmp(name, #n)) { sCfg.m = calcColor(value); }
 
 inline uint32_t calcColor(const char *value) {
-    uint32_t c = 0xFF000000u | strtoul(value, nullptr, 0);
+    uint32_t c = strtoul(value, nullptr, 0);
     const char *tok = strchr(value, ',');
-    if (!tok) { return c; }
-    c |= strtoul(++tok, nullptr, 0) << 8;
-    tok = strchr(tok, ',');
-    if (!tok) { return c; }
-    c |= strtoul(++tok, nullptr, 0) << 16;
+    if (tok) {
+        c |= strtoul(++tok, nullptr, 0) << 8;
+        tok = strchr(tok, ',');
+        if (tok) {
+            c |= strtoul(++tok, nullptr, 0) << 16;
+            tok = strchr(tok, ',');
+            if (tok) {
+                c |= strtoul(++tok, nullptr, 0) * sCfg.alpha / 255 << 24;
+            } else {
+                c |= 0xFF000000u;
+            }
+        }
+    }
     return c;
 }
 
 void loadCfg(const std::string &filename) {
+    sCfg = Cfg {};
     int section = -1;
     ini_parse(filename.c_str(), [](void* user, const char* section,
                                    const char* name, const char* value)->int {
@@ -42,6 +56,7 @@ void loadCfg(const std::string &filename) {
             if (!strcmp(section, "main")) { *(int*)user = 0; }
             else if (!strcmp(section, "ui")) { *(int*)user = 1; }
             else if (!strcmp(section, "enchants")) { *(int*)user = 2; }
+            else if (!strcmp(section, "sound")) { *(int*)user = 3; }
             else { *(int*)user = -1; }
             return 1;
         }
@@ -66,6 +81,7 @@ void loadCfg(const std::string &filename) {
             LOADVALN(map_centered, mapCentered)
 
             LOADVALN(alpha, alpha)
+            LOADVALN(neighbour_map_bounds, neighbourMapBounds)
             LOADVALC(walkable_color, walkableColor)
             LOADVALC(edge_color, edgeColor)
             LOADVALC(text_color, textColor)
@@ -84,6 +100,8 @@ void loadCfg(const std::string &filename) {
             LOADVALC(door_color, doorColor)
             LOADVALC(msg_bg_color, msgBgColor)
             LOADVAL(msg_position, msgPosition)
+            LOADVALW(text_panel_pattern, panelPattern)
+            LOADVAL(text_panel_position, panelPosition)
 
             LOADVALN(show_player_names, showPlayerNames)
             LOADVALN(show_npc_names, showNpcNames)
@@ -132,6 +150,19 @@ void loadCfg(const std::string &filename) {
             LOADVALW(cold_immunity, encTxtColdImmunity)
             LOADVALW(poison_immunity, encTxtPoisonImmunity)
             break;
+        case 3: {
+            if (strncmp(name, "sound[", 6) != 0) { break; }
+            auto index = size_t(strtol(name + 6, nullptr, 0));
+            if (!index) { break; }
+            if (index >= sCfg.sounds.size()) { sCfg.sounds.resize(index + 1); }
+            auto vlen = strlen(value);
+            if (!strcasecmp(value + vlen - 4, ".wav")) {
+                sCfg.sounds[index] = {utf8toucs4(value), false};
+            } else {
+                sCfg.sounds[index] = {utf8toucs4(value), true};
+            }
+            break;
+        }
         default:
             break;
         }
@@ -142,8 +173,10 @@ void loadCfg(const std::string &filename) {
     if (!sCfg.mapArea.empty()) {
         auto vec = splitString(sCfg.mapArea, ',');
         if (vec.size() > 1) {
-            sCfg.mapAreaW = std::clamp(strtof(vec[0].c_str(), nullptr), 0.1f, 1.f);
-            sCfg.mapAreaH = std::clamp(strtof(vec[1].c_str(), nullptr), 0.1f, 1.f);
+            sCfg.mapAreaW = std::clamp(strtof(vec[0].c_str(), nullptr), 0.f, 1.f);
+            sCfg.mapAreaH = std::clamp(strtof(vec[1].c_str(), nullptr), 0.f, 1.f);
+        } else {
+            sCfg.mapAreaW = sCfg.mapAreaH = std::clamp(strtof(sCfg.mapArea.c_str(), nullptr), 0.f, 1.f);
         }
     }
     if (!sCfg.msgPosition.empty()) {
@@ -158,5 +191,36 @@ void loadCfg(const std::string &filename) {
         if (sz > 2) {
             sCfg.msgAlign = std::clamp(int(strtol(vec[2].c_str(), nullptr, 0)), 0, 2);
         }
+    }
+    if (!sCfg.panelPattern.empty()) {
+        sCfg.panelPatterns.clear();
+        typename std::wstring::size_type pos = 0, last = 0;
+        while ((pos = sCfg.panelPattern.find(L"{newline}", last)) != std::wstring::npos) {
+            sCfg.panelPatterns.emplace_back(sCfg.panelPattern.substr(last, pos - last));
+            last = pos + 9;
+        }
+        if (last < sCfg.panelPattern.size()) {
+            sCfg.panelPatterns.emplace_back(sCfg.panelPattern.substr(last));
+        }
+    }
+    if (!sCfg.panelPosition.empty()) {
+        auto vec = splitString(sCfg.panelPosition, ',');
+        auto sz = vec.size();
+        if (sz > 0) {
+            sCfg.panelPositionX = std::clamp(strtof(vec[0].c_str(), nullptr), 0.f, 1.f) - .5f;
+        }
+        if (sz > 1) {
+            sCfg.panelPositionY = std::clamp(strtof(vec[1].c_str(), nullptr), 0.f, 1.f) - .5f;
+        }
+        if (sz > 2) {
+            sCfg.panelAlign = std::clamp(int(strtol(vec[2].c_str(), nullptr, 0)), 0, 2);
+        }
+    }
+    for (auto *color:
+        {&sCfg.walkableColor, &sCfg.edgeColor, &sCfg.textColor, &sCfg.playerInnerColor, &sCfg.playerOuterColor,
+         &sCfg.lineColor, &sCfg.waypointColor, &sCfg.portalColor, &sCfg.chestColor, &sCfg.questColor, &sCfg.shrineColor,
+         &sCfg.wellColor, &sCfg.uniqueMonsterColor, &sCfg.monsterColor, &sCfg.npcColor, &sCfg.doorColor,
+         &sCfg.msgBgColor,}) {
+        *color = (((*color >> 24) * sCfg.alpha / 255) << 24) | (*color & 0xFFFFFFu);
     }
 }

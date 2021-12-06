@@ -3,10 +3,10 @@ name: CMake
 on:
   push:
     branches: [ master ]
-    paths: [ CMakeLists.txt, 'src/**', 'd2mapapi/**', 'common/**', 'tools/**', 'json/**', 'inih/**' ]
+    paths: [ ".github/workflows/build.yml", CMakeLists.txt, 'src/**', 'd2mapapi/**', 'tools/**', 'inih/**' ]
   pull_request:
     branches: [ master ]
-    paths: [ CMakeLists.txt, 'src/**', 'd2mapapi/**', 'common/**', 'tools/**', 'json/**', 'inih/**' ]
+    paths: [ ".github/workflows/build.yml", CMakeLists.txt, 'src/**', 'd2mapapi/**', 'tools/**', 'inih/**' ]
 
 env:
   BUILD_TYPE: Release
@@ -15,19 +15,24 @@ jobs:
   build:
     runs-on: windows-latest
 
+    strategy:
+      matrix:
+        compiler: ["msys2_mingw", "msvc2019"]
+
     steps:
-    - uses: actions/checkout@v2
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
 
-    - name: CMake Configure
-      run: cmake -B ${{github.workspace}}/build -G "Visual Studio 16 2019" -A Win32 -DUSE_STATIC_CRT=ON
+      - name: CMake Configure and Build
+        shell: cmd
+        working-directory: ${{github.workspace}}
+        run: "build_${{matrix.compiler}}.bat"
 
-    - name: Build
-      # Build your program with the given configuration
-      run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target snapshot-pack
-
-    - uses: actions/upload-artifact@v2
-      with: 
-        name: D2RMH-snapshot
-        path: |
-          ${{github.workspace}}/build/bin/D2RMH-snapshot.zip
-        retention-days: 7
+      - uses: actions/upload-artifact@v2
+        with:
+          name: D2RMH-snapshot-${{matrix.compiler}}
+          path: |
+            ${{github.workspace}}/build/${{matrix.compiler}}/dist/D2RMH-snapshot.zip
+          retention-days: 7

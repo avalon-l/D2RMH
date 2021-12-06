@@ -9,6 +9,7 @@
 #include "renderer.h"
 
 #include "window.h"
+#include "util.h"
 
 #include "HandmadeMath.h"
 #include <glad/glad_wgl.h>
@@ -42,7 +43,7 @@ struct RendererCtx {
     int width = 0, height = 0;
     Texture *background = nullptr;
 
-    float clearColor[4] = {.0, .0, .0, 1.};
+    float clearColor[4] = {.0, .0, .0, .0};
 };
 
 Renderer::Renderer(Window *wnd): ctx_(new RendererCtx) {
@@ -55,10 +56,10 @@ Renderer::Renderer(Window *wnd): ctx_(new RendererCtx) {
     ctx_->wglDeleteContext = (PFNWGLDELETECONTEXTPROC)GetProcAddress(ctx_->lib, "wglDeleteContext");
     ctx_->wglMakeCurrent = (PFNWGLMAKECURRENTPROC)GetProcAddress(ctx_->lib, "wglMakeCurrent");
     PIXELFORMATDESCRIPTOR pfd = {
-        sizeof(PIXELFORMATDESCRIPTOR), 1, PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER,
-        PFD_TYPE_RGBA, 32, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0,
-        24, 8, 0, PFD_MAIN_PLANE,
+        sizeof(PIXELFORMATDESCRIPTOR), 1, PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER | PFD_SUPPORT_COMPOSITION,
+        PFD_TYPE_RGBA, 32, 8, 0, 8, 0, 8, 0,
+        8, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, PFD_MAIN_PLANE,
         0, 0, 0, 0
     };
     ctx_->dc = GetDC((HWND)wnd->hwnd());
@@ -96,7 +97,7 @@ void Renderer::setViewport(int x, int y, int w, int h) {
 }
 void Renderer::limitFPS(uint32_t fps) {
     if (fps) {
-        ctx_->renderInterval = std::chrono::nanoseconds (1000 * 1000 * 1000) / fps;
+        ctx_->renderInterval = std::chrono::nanoseconds(1000 * 1000 * 1000) / fps;
         ctx_->fpsLimit = true;
     } else {
         ctx_->fpsLimit = false;
@@ -112,9 +113,10 @@ void Renderer::setClearColor(float r, float g, float b, float a) {
 void Renderer::prepare() {
     if (ctx_->fpsLimit) {
         do {
-            auto now = std::chrono::steady_clock::now();
+            auto now = getCurrTime();
             if (ctx_->nextRenderTime > now) {
                 std::this_thread::sleep_for(ctx_->nextRenderTime - now);
+                updateTime();
                 continue;
             }
             ctx_->nextRenderTime += ctx_->renderInterval;
@@ -130,7 +132,7 @@ void Renderer::begin() {
 
     auto *c = ctx_->clearColor;
     glClearColor(c[0], c[1], c[2], c[3]);
-    glClear(GL_COLOR_BUFFER_BIT);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 }
 void Renderer::end() {
     SwapBuffers(ctx_->dc);
@@ -257,6 +259,14 @@ Texture::~Texture() {
     if (uid_) {
         glDeleteTextures(1, &uid_);
     }
+}
+Texture::Texture(Texture &&other) noexcept {
+    uid_ = other.uid_;
+    width_ = other.width_;
+    height_ = other.height_;
+    widthReal_ = other.widthReal_;
+    heightReal_ = other.heightReal_;
+    other.uid_ = 0;
 }
 void Texture::create(int width, int height) {
     width_ = roundup(width);
@@ -443,63 +453,63 @@ void Pipeline::init(ShaderProgram *prog, int stri, const VertexAttribPointer *va
         VertexAttribPointerLayout vapp;
         switch (vap->fmt) {
         case VERTEXFORMAT_FLOAT:
-            vapp = { 1, GL_FLOAT, GL_FALSE, (const void*)(vap->offset == 0 ? total : vap->offset) };
+            vapp = { 1, GL_FLOAT, GL_FALSE, (const void*)(uintptr_t)(vap->offset == 0 ? total : vap->offset) };
             total += 4;
             break;
         case VERTEXFORMAT_FLOAT2:
-            vapp = { 2, GL_FLOAT, GL_FALSE, (const void*)(vap->offset == 0 ? total : vap->offset) };
+            vapp = { 2, GL_FLOAT, GL_FALSE, (const void*)(uintptr_t)(vap->offset == 0 ? total : vap->offset) };
             total += 8;
             break;
         case VERTEXFORMAT_FLOAT3:
-            vapp = { 3, GL_FLOAT, GL_FALSE, (const void*)(vap->offset == 0 ? total : vap->offset) };
+            vapp = { 3, GL_FLOAT, GL_FALSE, (const void*)(uintptr_t)(vap->offset == 0 ? total : vap->offset) };
             total += 12;
             break;
         case VERTEXFORMAT_FLOAT4:
-            vapp = { 4, GL_FLOAT, GL_FALSE, (const void*)(vap->offset == 0 ? total : vap->offset) };
+            vapp = { 4, GL_FLOAT, GL_FALSE, (const void*)(uintptr_t)(vap->offset == 0 ? total : vap->offset) };
             total += 16;
             break;
         case VERTEXFORMAT_BYTE4:
-            vapp = { 4, GL_BYTE, GL_FALSE, (const void*)(vap->offset == 0 ? total : vap->offset) };
+            vapp = { 4, GL_BYTE, GL_FALSE, (const void*)(uintptr_t)(vap->offset == 0 ? total : vap->offset) };
             total += 4;
             break;
         case VERTEXFORMAT_BYTE4N:
-            vapp = { 4, GL_BYTE, GL_TRUE, (const void*)(vap->offset == 0 ? total : vap->offset) };
+            vapp = { 4, GL_BYTE, GL_TRUE, (const void*)(uintptr_t)(vap->offset == 0 ? total : vap->offset) };
             total += 4;
             break;
         case VERTEXFORMAT_UBYTE4:
-            vapp = { 4, GL_UNSIGNED_BYTE, GL_FALSE, (const void*)(vap->offset == 0 ? total : vap->offset) };
+            vapp = { 4, GL_UNSIGNED_BYTE, GL_FALSE, (const void*)(uintptr_t)(vap->offset == 0 ? total : vap->offset) };
             total += 4;
             break;
         case VERTEXFORMAT_UBYTE4N:
-            vapp = { 4, GL_UNSIGNED_BYTE, GL_TRUE, (const void*)(vap->offset == 0 ? total : vap->offset) };
+            vapp = { 4, GL_UNSIGNED_BYTE, GL_TRUE, (const void*)(uintptr_t)(vap->offset == 0 ? total : vap->offset) };
             total += 4;
             break;
         case VERTEXFORMAT_SHORT2:
-            vapp = { 2, GL_SHORT, GL_FALSE, (const void*)(vap->offset == 0 ? total : vap->offset) };
+            vapp = { 2, GL_SHORT, GL_FALSE, (const void*)(uintptr_t)(vap->offset == 0 ? total : vap->offset) };
             total += 4;
             break;
         case VERTEXFORMAT_SHORT2N:
-            vapp = { 2, GL_SHORT, GL_TRUE, (const void*)(vap->offset == 0 ? total : vap->offset) };
+            vapp = { 2, GL_SHORT, GL_TRUE, (const void*)(uintptr_t)(vap->offset == 0 ? total : vap->offset) };
             total += 4;
             break;
         case VERTEXFORMAT_USHORT2N:
-            vapp = { 2, GL_UNSIGNED_SHORT, GL_TRUE, (const void*)(vap->offset == 0 ? total : vap->offset) };
+            vapp = { 2, GL_UNSIGNED_SHORT, GL_TRUE, (const void*)(uintptr_t)(vap->offset == 0 ? total : vap->offset) };
             total += 4;
             break;
         case VERTEXFORMAT_SHORT4:
-            vapp = { 4, GL_SHORT, GL_FALSE, (const void*)(vap->offset == 0 ? total : vap->offset) };
+            vapp = { 4, GL_SHORT, GL_FALSE, (const void*)(uintptr_t)(vap->offset == 0 ? total : vap->offset) };
             total += 8;
             break;
         case VERTEXFORMAT_SHORT4N:
-            vapp = { 4, GL_SHORT, GL_TRUE, (const void*)(vap->offset == 0 ? total : vap->offset) };
+            vapp = { 4, GL_SHORT, GL_TRUE, (const void*)(uintptr_t)(vap->offset == 0 ? total : vap->offset) };
             total += 8;
             break;
         case VERTEXFORMAT_USHORT4N:
-            vapp = { 4, GL_UNSIGNED_SHORT, GL_TRUE, (const void*)(vap->offset == 0 ? total : vap->offset) };
+            vapp = { 4, GL_UNSIGNED_SHORT, GL_TRUE, (const void*)(uintptr_t)(vap->offset == 0 ? total : vap->offset) };
             total += 8;
             break;
         case VERTEXFORMAT_UINT10_N2:
-            vapp = { 4, GL_UNSIGNED_INT_2_10_10_10_REV, GL_TRUE, (const void*)(vap->offset == 0 ? total : vap->offset) };
+            vapp = { 4, GL_UNSIGNED_INT_2_10_10_10_REV, GL_TRUE, (const void*)(uintptr_t)(vap->offset == 0 ? total : vap->offset) };
             break;
         default:
             continue;

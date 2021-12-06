@@ -483,6 +483,10 @@ struct MonsterData {
     uint8_t enchants[9];
     uint8_t unk0;
     uint16_t uniqueNo;
+    uint32_t unk1;
+    uint16_t unk2;
+    uint16_t mercNameId;
+    uint32_t unk3;
 };
 
 struct ItemData {
@@ -612,6 +616,7 @@ struct UnitAny {
     uint64_t inventoryPtr;
     uint64_t unk5[23];
     uint64_t nextPtr;
+    uint64_t roomNextPtr;
 };
 
 #pragma pack(pop)

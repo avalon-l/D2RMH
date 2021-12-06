@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <vector>
 #include <string>
 
 struct Cfg {
@@ -19,15 +20,16 @@ struct Cfg {
 
     int fps = -1;
     int show = 0;
-    uint32_t panelMask = 0x7F;
+    uint32_t panelMask = 0x1FF;
     int fullLine = 0;
     int position = 2;
     std::string mapArea;
-    float mapAreaW = 1.f;
-    float mapAreaH = 1.f;
+    float mapAreaW = .0f;
+    float mapAreaH = .0f;
     float scale = 2.f;
     int mapCentered = 1;
     uint8_t alpha = 170;
+    int neighbourMapBounds = -1;
 #define RGBA(r, g, b, a) (uint32_t(r) | (uint32_t(g) << 8) | (uint32_t(b) << 16) | (uint32_t(a) << 24))
     uint32_t walkableColor = RGBA(20, 20, 20, 255);
     uint32_t edgeColor = RGBA(128, 128, 128, 255);
@@ -47,10 +49,16 @@ struct Cfg {
     uint32_t doorColor = RGBA(80, 255, 80, 255);
     uint32_t msgBgColor = RGBA(1, 1, 1, 255);
 #undef RGBA
-    std::string msgPosition;
-    float msgPositionX = .95f - .5f;
-    float msgPositionY = .25f - .5f;
-    int msgAlign = 2;
+    std::string msgPosition = "0.95,0.25,2";
+    float msgPositionX = .0f;
+    float msgPositionY = .0f;
+    int msgAlign = 0;
+    std::wstring panelPattern;
+    std::string panelPosition = "0.93,0.015,2";
+    std::vector<std::wstring> panelPatterns;
+    float panelPositionX = .0f;
+    float panelPositionY = .0f;
+    int panelAlign = 0;
 
     int showPlayerNames = 1;
     int showNpcNames = 1;
@@ -91,6 +99,8 @@ struct Cfg {
     std::wstring encTxtLightningImmunity = L"{9}i";
     std::wstring encTxtColdImmunity = L"{3}i";
     std::wstring encTxtPoisonImmunity = L"{2}i";
+
+    std::vector<std::pair<std::wstring, bool>> sounds;
 };
 
 extern void loadCfg(const std::string &filename = "D2RMH.ini");

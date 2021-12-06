@@ -14,12 +14,13 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 #include "window.h"
 
-#include "cfg.h"
-
 #include <windows.h>
+#include <versionhelpers.h>
+#include <dwmapi.h>
 #include <commctrl.h>
 #include <stdexcept>
 #include <map>
+#include <string>
 
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 #define HINST_THISCOMPONENT ((HINSTANCE)&__ImageBase)
@@ -28,6 +29,10 @@ EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 struct MenuItem {
     UINT id = 0;
     HMENU submenu = nullptr;
+
+    std::wstring name;
+    int parent = 0;
+    unsigned flags = 0;
     std::function<void()> cb;
 };
 
@@ -39,10 +44,49 @@ struct WindowCtx {
     bool running = false;
     UINT userMsg = WM_USER + 1;
     std::map<UINT, MenuItem> trayMenuInfo;
+    struct {
+        bool enabled = false;
+        const wchar_t *icon = nullptr;
+        std::wstring tip, info, infoTitle;
+    } trayMenuBase;
 };
 
+static bool updateFramebufferTransparency(HWND hwnd) {
+    BOOL composition, opaque;
+    DWORD color;
+
+    if (!IsWindowsVistaOrGreater())
+        return false;
+
+    if (FAILED(DwmIsCompositionEnabled(&composition)) || !composition)
+        return false;
+
+    if (IsWindows8OrGreater() ||
+        (SUCCEEDED(DwmGetColorizationColor(&color, &opaque)) && !opaque)) {
+        HRGN region = CreateRectRgn(0, 0, -1, -1);
+        DWM_BLURBEHIND bb = {0};
+        bb.dwFlags = DWM_BB_ENABLE | DWM_BB_BLURREGION;
+        bb.hRgnBlur = region;
+        bb.fEnable = TRUE;
+
+        DwmEnableBlurBehindWindow(hwnd, &bb);
+        MARGINS m = {-1};
+        DeleteObject(region);
+    } else {
+        DWM_BLURBEHIND bb = {0};
+        bb.dwFlags = DWM_BB_ENABLE;
+        DwmEnableBlurBehindWindow(hwnd, &bb);
+    }
+    return true;
+}
+
 static LRESULT CALLBACK wndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    static UINT taskbarRestartMsg;
     switch (uMsg) {
+    case WM_CREATE: {
+        taskbarRestartMsg = RegisterWindowMessageW(L"TaskbarCreated");
+        break;
+    }
     case WM_DESTROY: {
         auto *ctx = ((Window*)GetWindowLongPtr(hwnd, GWLP_USERDATA))->ctx();
         if (ctx->nid.cbSize) {
@@ -83,7 +127,26 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
         ite->second.cb();
         return 0;
     }
+    case WM_DWMCOMPOSITIONCHANGED:
+    case WM_DWMCOLORIZATIONCOLORCHANGED: {
+        auto *ctx = ((Window*)GetWindowLongPtr(hwnd, GWLP_USERDATA))->ctx();
+        updateFramebufferTransparency(ctx->hwnd);
+        return 0;
+    }
     default:
+        if (uMsg == taskbarRestartMsg) {
+            auto *win = (Window*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+            auto *ctx = win->ctx();
+            if (!ctx->trayMenuBase.enabled) {
+                break;
+            }
+            auto m = ctx->trayMenuInfo;
+            win->destroyTrayMenu();
+            win->enableTrayMenu(true, ctx->trayMenuBase.icon, ctx->trayMenuBase.tip.c_str(), ctx->trayMenuBase.info.c_str(), ctx->trayMenuBase.infoTitle.c_str());
+            for (auto &p: m) {
+                win->addTrayMenuItem(p.second.name.c_str(), p.second.parent, p.second.flags, p.second.cb);
+            }
+        }
         break;
     }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
@@ -119,7 +182,8 @@ Window::Window(int x, int y, int width, int height): ctx_(new WindowCtx) {
         throw std::runtime_error("Unable to create window");
     }
     SetWindowLongPtr(ctx_->hwnd, GWLP_USERDATA, (LONG_PTR)this);
-    SetLayeredWindowAttributes(ctx_->hwnd, 0, cfg->alpha, LWA_COLORKEY | LWA_ALPHA);
+    SetLayeredWindowAttributes(ctx_->hwnd, 0, 0, 0);
+    updateFramebufferTransparency(ctx_->hwnd);
     ShowWindow(ctx_->hwnd, SW_SHOW);
     ctx_->running = true;
 }
@@ -131,8 +195,11 @@ Window::~Window() {
     delete ctx_;
 }
 
-BOOL CALLBACK dialogProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+INT_PTR CALLBACK dialogProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
+    case WM_CLOSE:
+        EndDialog(hWnd, TRUE);
+        break;
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case IDOK:
@@ -164,7 +231,23 @@ BOOL CALLBACK dialogProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
         auto width = rc2.right - rc2.left;
         auto height = rc2.bottom - rc2.top;
         MoveWindow(hWnd, (rc.right + rc.left - width) / 2, (rc.top + rc.bottom - height) / 2, width, height, FALSE);
+        auto caption = GetDlgItem(hWnd, 1000);
+        SetWindowTextW(caption, L"D2RMH " VERSION_STRING_FULL);
+        auto font = HFONT(SendMessage(caption, WM_GETFONT, 0, 0));
+        LOGFONTW lf = {};
+        GetObjectW(font, sizeof(lf), &lf);
+        lf.lfHeight *= 2; lf.lfWidth *= 2;
+        auto font2 = CreateFontIndirectW(&lf);
+        SendMessage(caption, WM_SETFONT, (WPARAM)font2, TRUE);
         break;
+    }
+    case WM_CTLCOLORSTATIC: {
+        if (GetDlgCtrlID((HWND)lParam) == 1000) {
+            SetTextColor((HDC)wParam, 0x881111);
+            SetBkMode((HDC)wParam, TRANSPARENT);
+            return (INT_PTR)::GetStockObject(NULL_BRUSH);
+        }
+        return FALSE;
     }
     default:
         return FALSE;
@@ -174,9 +257,11 @@ BOOL CALLBACK dialogProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 }
 
 void Window::enableTrayMenu(bool enable, const wchar_t *icon, const wchar_t *tip, const wchar_t *info, const wchar_t *infoTitle) {
+    ctx_->trayMenuBase = {enable, icon, tip ? tip : L"", info ? info : L"", infoTitle ? infoTitle : L""};
     if (!enable) {
         if (ctx_->nid.cbSize) {
             Shell_NotifyIconW(NIM_DELETE, &ctx_->nid);
+            memset(&ctx_->nid, 0, sizeof(ctx_->nid));
         }
         return;
     }
@@ -192,11 +277,11 @@ void Window::enableTrayMenu(bool enable, const wchar_t *icon, const wchar_t *tip
     ctx_->nid.hWnd = ctx_->hwnd;
     ctx_->nid.uID = 0;
     ctx_->nid.uFlags = NIF_ICON | NIF_MESSAGE;
-    if (tip) {
+    if (tip && tip[0]) {
         ctx_->nid.uFlags |= NIF_TIP;
         lstrcpyW(ctx_->nid.szTip, tip);
     }
-    if (info && infoTitle) {
+    if (info && info[0] && infoTitle && infoTitle[0]) {
         ctx_->nid.uFlags |= NIF_INFO;
         lstrcpyW(ctx_->nid.szInfo, info);
         lstrcpyW(ctx_->nid.szInfoTitle, infoTitle);
@@ -211,13 +296,15 @@ void Window::enableTrayMenu(bool enable, const wchar_t *icon, const wchar_t *tip
     Shell_NotifyIconW(NIM_ADD, &ctx_->nid);
 
     ctx_->trayMenu = CreatePopupMenu();
+}
+
+void Window::addAboutMenu() {
     addTrayMenuItem(L"About", -1, 0, [] {
         DialogBox(HINST_THISCOMPONENT, MAKEINTRESOURCE(101), nullptr, dialogProc);
     });
 }
 
 int Window::addTrayMenuItem(const wchar_t *name, int parent, unsigned flags, const std::function<void()> &cb) {
-    auto &st = ctx_->trayMenuInfo[ctx_->userMsg];
     HMENU parentMenu;
     if (parent < 0) {
         parentMenu = ctx_->trayMenu;
@@ -228,6 +315,7 @@ int Window::addTrayMenuItem(const wchar_t *name, int parent, unsigned flags, con
         }
         parentMenu = ite->second.submenu;
     }
+    auto &st = ctx_->trayMenuInfo[ctx_->userMsg];
     if (lstrcmpW(name, L"-") == 0) {
         InsertMenuW(parentMenu, ctx_->userMsg, MF_SEPARATOR, TRUE, L"");
     } else {
@@ -253,8 +341,24 @@ int Window::addTrayMenuItem(const wchar_t *name, int parent, unsigned flags, con
         InsertMenuItemW(parentMenu, ctx_->userMsg, TRUE, &item);
     }
     st.id = ctx_->userMsg++;
+
+    st.name = name;
+    st.parent = parent;
+    st.flags = flags;
     st.cb = cb;
     return st.id;
+}
+
+void Window::destroyTrayMenu() {
+    if (ctx_->nid.cbSize) {
+        Shell_NotifyIconW(NIM_DELETE, &ctx_->nid);
+        memset(&ctx_->nid, 0, sizeof(ctx_->nid));
+    }
+    ctx_->trayMenuBase.enabled = false;
+    DestroyMenu(ctx_->trayMenu);
+    ctx_->trayMenu = nullptr;
+    ctx_->trayMenuInfo.clear();
+    ctx_->userMsg = WM_USER + 1;
 }
 
 bool Window::run() const {
@@ -285,16 +389,21 @@ void Window::getDimension(int &w, int &h) {
     h = rc.bottom - rc.top;
 }
 
-void *Window::hwnd() {
-    return (void*)ctx_->hwnd;
-}
-
 void Window::move(int x, int y, int w, int h) {
     auto exStyle = GetWindowLong(ctx_->hwnd, GWL_EXSTYLE);
     auto style = GetWindowLong(ctx_->hwnd, GWL_STYLE);
     RECT rc = {x, y, x + w, y + h};
     AdjustWindowRectEx(&rc, style, FALSE, exStyle);
     MoveWindow(ctx_->hwnd, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, FALSE);
+}
+
+void Window::reloadConfig() {
+    SetLayeredWindowAttributes(ctx_->hwnd, 0, 0, 0);
+    updateFramebufferTransparency(ctx_->hwnd);
+}
+
+void *Window::hwnd() {
+    return (void*)ctx_->hwnd;
 }
 
 void Window::setSizeCallback(const std::function<void(int, int)> &cb) {

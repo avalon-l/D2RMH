@@ -8,14 +8,14 @@
 
 #include "d2rprocess.h"
 
-#include "wow64_process.h"
+#include "ntprocess.h"
 #include "cfg.h"
 #include "data.h"
 #include "d2rdefs.h"
 #include "util.h"
 
 #include <windows.h>
-#include <tlhelp32.h>
+#include <psapi.h>
 #include <shlwapi.h>
 #include <cstdio>
 
@@ -298,15 +298,19 @@ void loadEncText(wchar_t *output, const std::wstring &input) {
 static uint8_t statsMapping[size_t(StatId::TotalCount)] = {};
 
 enum {
+    /* These 2 offsets are no more used, use memory search now
     HashTableBase = 0x20AF660,
     UIBaseAddr = 0x20BF310,
+    */
     InventoryPanelOffset = 0x09,
     CharacterPanelOffset = 0x0A,
+    SkillFloatSelOffset = 0x0B,
     SkillTreePanelOffset = 0x0C,
     ChatMenuOffset = 0x10,
     SystemMenuOffset = 0x11,
     InGameMapOffset = 0x12,
     QuestPanelOffset = 0x16,
+    WaypointPanelOffset = 0x1B,
     PartyPanelOffset = 0x1D,
     MercenaryOffset = 0x26,
 };
@@ -336,38 +340,10 @@ HWND findMainWindow(unsigned long processId) {
     return data.hwnd;
 }
 
-#define READ(a, v) readMemory64(handle_, (a), sizeof(v), &(v))
+#define READ(a, v) readMemory64(currProcess->handle, (a), sizeof(v), &(v))
 
-D2RProcess::D2RProcess(uint32_t searchInterval): searchInterval_(searchInterval) {
-    loadEncText(enchantStrings[5], cfg->encTxtExtraStrong);
-    loadEncText(enchantStrings[6], cfg->encTxtExtraFast);
-    loadEncText(enchantStrings[7], cfg->encTxtCursed);
-    loadEncText(enchantStrings[8], cfg->encTxtMagicResistant);
-    loadEncText(enchantStrings[9], cfg->encTxtFireEnchanted);
-    loadEncText(enchantStrings[17], cfg->encTxtLigntningEnchanted);
-    loadEncText(enchantStrings[18], cfg->encTxtColdEnchanted);
-    loadEncText(enchantStrings[25], cfg->encTxtManaBurn);
-    loadEncText(enchantStrings[26], cfg->encTxtTeleportation);
-    loadEncText(enchantStrings[27], cfg->encTxtSpectralHit);
-    loadEncText(enchantStrings[28], cfg->encTxtStoneSkin);
-    loadEncText(enchantStrings[29], cfg->encTxtMultipleShots);
-    loadEncText(enchantStrings[37], cfg->encTxtFanatic);
-    loadEncText(enchantStrings[39], cfg->encTxtBerserker);
-
-    loadEncText(auraStrings[33], cfg->MightAura);
-    loadEncText(auraStrings[35], cfg->HolyFireAura);
-    loadEncText(auraStrings[40], cfg->BlessedAimAura);
-    loadEncText(auraStrings[43], cfg->HolyFreezeAura);
-    loadEncText(auraStrings[46], cfg->HolyShockAura);
-    loadEncText(auraStrings[28], cfg->ConvictionAura);
-    loadEncText(auraStrings[49], cfg->FanaticismAura);
-
-    loadEncText(immunityStrings[0], cfg->encTxtPhysicalImmunity);
-    loadEncText(immunityStrings[1], cfg->encTxtMagicImmunity);
-    loadEncText(immunityStrings[2], cfg->encTxtFireImmunity);
-    loadEncText(immunityStrings[3], cfg->encTxtLightningImmunity);
-    loadEncText(immunityStrings[4], cfg->encTxtColdImmunity);
-    loadEncText(immunityStrings[5], cfg->encTxtPoisonImmunity);
+D2RProcess::D2RProcess(uint32_t searchInterval):
+    searchInterval_(std::chrono::milliseconds(searchInterval)) {
     std::pair<StatId, size_t> statsMappingInit[] = {
         {StatId::Damageresist, 0},
         {StatId::Magicresist, 1},
@@ -380,57 +356,131 @@ D2RProcess::D2RProcess(uint32_t searchInterval): searchInterval_(searchInterval)
         statsMapping[size_t(k)] = v;
     }
 
-    searchForProcess();
-    nextSearchTime_ = timeGetTime() + searchInterval_;
+    loadFromCfg();
 }
 
-D2RProcess::~D2RProcess() {
-    if (handle_) { CloseHandle(handle_); }
+inline bool matchMem(size_t sz, const uint8_t* mem, const uint8_t* search, const uint8_t* mask) {
+    for (size_t i = 0; i < sz; ++i) {
+        uint8_t m = mask[i];
+        if ((mem[i] & m) != (search[i] & m)) { return false; }
+    }
+    return true;
+}
+
+inline size_t searchMem(const uint8_t *mem, size_t sz, const uint8_t* search, const uint8_t* mask, size_t searchSz) {
+    if (sz < searchSz) { return size_t(-1); }
+    size_t e = sz - searchSz + 1;
+    for (size_t i = 0; i < e; ++i) {
+        if (matchMem(searchSz, mem + i, search, mask)) {
+            return i;
+        }
+    }
+    return size_t(-1);
 }
 
 void D2RProcess::updateData() {
-    available_ = false;
-    if (handle_) {
-        DWORD ret = WaitForSingleObject(handle_, 0);
-        if (ret != WAIT_TIMEOUT) {
-            resetData();
-            auto now = timeGetTime();
-            bool searchProcess = int(now - nextSearchTime_) >= 0;
-            if (searchProcess) {
-                searchForProcess();
-                nextSearchTime_ = now + searchInterval_;
+    auto foregroundWnd = GetForegroundWindow();
+    if (!currProcess_ || foregroundWnd != currProcess_->hwnd) {
+        for (auto ite = processes_.begin(); ite != processes_.end();) {
+            DWORD ret = WaitForSingleObject(ite->second.handle, 0);
+            if (ret == WAIT_TIMEOUT) {
+                ++ite;
+            } else {
+                if (processCloseCallback_) {
+                    processCloseCallback_(ite->first);
+                }
+                ite = processes_.erase(ite);
             }
         }
-    } else {
-        auto now = timeGetTime();
-        bool searchProcess = int(now - nextSearchTime_) >= 0;
-        if (searchProcess) {
-            searchForProcess();
+        currProcess_ = nullptr;
+        auto now = getCurrTime();
+        if (now >= nextSearchTime_) {
+            searchForProcess(foregroundWnd);
             nextSearchTime_ = now + searchInterval_;
         }
     }
-    if (!handle_) { return; }
-    if (hwnd_ && GetForegroundWindow() != hwnd_) { return; }
+    if (!currProcess_) {
+        return;
+    }
 
-    mapPlayers_.clear();
+    auto *currProcess = currProcess_;
+    uint8_t lastDifficulty;
+    uint32_t lastSeed, lastAct, lastLevelId;
+    auto *currPlayer = currProcess->currPlayer;
+    if (currPlayer) {
+        lastDifficulty = currPlayer->difficulty;
+        lastSeed = currPlayer->seed;
+        lastAct = currPlayer->act;
+        lastLevelId = currPlayer->levelId;
+    } else {
+        lastDifficulty = uint8_t(-1);
+        lastSeed = 0;
+        lastAct = uint32_t(-1);
+        lastLevelId = uint32_t(-1);
+    }
 
-    MapPlayer *currPlayer = nullptr;
-    readUnitHashTable(baseAddr_ + HashTableBase, [this, &currPlayer](const UnitAny &unit) {
+    currProcess->mapPlayers.clear();
+    if (cfg->showMonsters) {
+        currProcess->mapMonsters.clear();
+    }
+    if (cfg->showItems) {
+        currProcess->mapItems.clear();
+    }
+
+    uint8_t expansion = 0;
+    READ(currProcess->isExpansionAddr, expansion);
+
+    currPlayer = nullptr;
+    readUnitHashTable(currProcess->hashTableBaseAddr, [this, expansion, &currPlayer, lastDifficulty, lastSeed, lastAct, lastLevelId](const UnitAny &unit) {
         if (!unit.unitId || !unit.actPtr || !unit.inventoryPtr) { return; }
+        auto *currProcess = currProcess_;
+        uint64_t token;
+        if (!READ(unit.inventoryPtr + (expansion ? 0x70 : 0x30), token) || token == (expansion ? 0 : 1)) {
+            /* --START-- remove this if using readRoomUnits() */
+            DrlgAct act;
+            if (!READ(unit.actPtr, act)) { return; }
+            auto &player = currProcess->mapPlayers[unit.unitId];
+            player.name[0] = 0;
+            READ(unit.unionPtr, player.name);
+            player.levelChanged = false;
+            player.act = act.actId;
+            player.seed = act.seed;
+            READ(act.miscPtr + 0x830, player.difficulty);
+            DynamicPath path;
+            if (!READ(unit.pathPtr, path)) { return; }
+            player.posX = path.posX;
+            player.posY = path.posY;
+            DrlgRoom1 room1;
+            if (!READ(path.room1Ptr, room1)) { return; }
+            DrlgRoom2 room2;
+            if (!READ(room1.room2Ptr, room2)) { return; }
+            if (!READ(room2.levelPtr + 0x1F8, player.levelId)) { return; }
+            /* --END-- remove this if using readRoomUnits() */
+            return;
+        }
         DrlgAct act;
         if (!READ(unit.actPtr, act)) { return; }
-        auto &player = mapPlayers_[unit.unitId];
+        auto &player = currProcess->mapPlayers[unit.unitId];
         player.name[0] = 0;
-        bool levelChanged = false;
         READ(unit.unionPtr, player.name);
-        if (uint64_t token; READ(unit.inventoryPtr + 0x70, token) && token != 0) {
-            focusedPlayer_ = unit.unitId;
-            currPlayer = &player;
-        }
-        player.levelChanged = player.act != act.actId;
-        player.act = act.actId;
-        player.seed = act.seed;
+        currProcess->focusedPlayer = unit.unitId;
+        currPlayer = &player;
         READ(act.miscPtr + 0x830, player.difficulty);
+        player.levelChanged = false;
+        player.seed = act.seed;
+        if (lastDifficulty != player.difficulty || lastSeed != act.seed) {
+            player.levelChanged = true;
+            currProcess->knownItems.clear();
+        }
+        player.act = act.actId;
+        if (lastAct != act.actId) {
+            player.levelChanged = true;
+        }
+        if (player.levelChanged) {
+            /* get real TalTomb level id */
+            READ(act.miscPtr + 0x120, currProcess->realTombLevelId);
+            READ(act.miscPtr + 0x874, currProcess->superUniqueTombLevelId);
+        }
         DynamicPath path;
         if (!READ(unit.pathPtr, path)) { return; }
         player.posX = path.posX;
@@ -441,205 +491,67 @@ void D2RProcess::updateData() {
         if (!READ(room1.room2Ptr, room2)) { return; }
         uint32_t levelId;
         if (!READ(room2.levelPtr + 0x1F8, levelId)) { return; }
-        if (player.levelId == levelId) { return; }
-        player.levelChanged = true;
+
         player.levelId = levelId;
+        if (levelId != lastLevelId) {
+            player.levelChanged = true;
+        }
+        if (player.levelChanged) {
+            if (cfg->showObjects) {
+                currProcess->mapObjects.clear();
+            }
+        }
+/*  this is another way of reading all units from memory, we may need this if we need to see units on neighbour levels
+        std::unordered_set<uint64_t> rset(256);
+        rset.insert(path.room1Ptr);
+        readRoomUnits(room1, rset);
+*/
     });
-    if (mapPlayers_.empty()) {
-        focusedPlayer_ = 0;
+    if (currProcess->mapPlayers.empty()) {
+        currProcess->focusedPlayer = 0;
         return;
     }
-    if (!focusedPlayer_) {
-        auto ite = mapPlayers_.begin();
-        focusedPlayer_ = ite->first;
+    if (!currProcess->focusedPlayer) {
+        auto ite = currProcess->mapPlayers.begin();
+        currProcess->focusedPlayer = ite->first;
         currPlayer = &ite->second;
     } else if (!currPlayer) {
-        auto ite = mapPlayers_.find(focusedPlayer_);
-        if (ite == mapPlayers_.end()) {
-            ite = mapPlayers_.begin();
-            focusedPlayer_ = ite->first;
+        auto ite = currProcess->mapPlayers.find(currProcess->focusedPlayer);
+        if (ite == currProcess->mapPlayers.end()) {
+            ite = currProcess->mapPlayers.begin();
+            currProcess->focusedPlayer = ite->first;
         }
         currPlayer = &ite->second;
     }
     uint8_t mem[0x28];
-    READ(baseAddr_ + UIBaseAddr, mem);
-    mapEnabled_ = mem[InGameMapOffset];
-    panelEnabled_ = 0;
-    if (mem[InventoryPanelOffset]) { panelEnabled_ |= 0x01; }
-    if (mem[CharacterPanelOffset]) { panelEnabled_ |= 0x02; }
-    if (mem[SkillTreePanelOffset]) { panelEnabled_ |= 0x04; }
-    if (mem[SystemMenuOffset]) { panelEnabled_ |= 0x08; }
-    if (mem[QuestPanelOffset]) { panelEnabled_ |= 0x10; }
-    if (mem[PartyPanelOffset]) { panelEnabled_ |= 0x20; }
-    if (mem[MercenaryOffset]) { panelEnabled_ |= 0x40; }
-    available_ = true;
-    currPlayer_ = currPlayer;
+    READ(currProcess->uiBaseAddr, mem);
+    currProcess->mapEnabled = mem[InGameMapOffset];
+    uint32_t panelEnabled = 0;
+    if (mem[InventoryPanelOffset]) { panelEnabled |= 0x01; }
+    if (mem[CharacterPanelOffset]) { panelEnabled |= 0x02; }
+    if (mem[SkillTreePanelOffset]) { panelEnabled |= 0x04; }
+    if (mem[SystemMenuOffset]) { panelEnabled |= 0x08; }
+    if (mem[QuestPanelOffset]) { panelEnabled |= 0x10; }
+    if (mem[PartyPanelOffset]) { panelEnabled |= 0x20; }
+    if (mem[MercenaryOffset]) { panelEnabled |= 0x40; }
+    if (mem[WaypointPanelOffset]) { panelEnabled |= 0x80; }
+    if (mem[SkillFloatSelOffset]) { panelEnabled |= 0x100; }
+    currProcess->panelEnabled = panelEnabled;
+    currProcess->currPlayer = currPlayer;
 
     if (cfg->showMonsters) {
-        mapMonsters_.clear();
-        auto monsSize = gamedata->monsters.size();
-        readUnitHashTable(baseAddr_ + HashTableBase + 8 * 0x80, [this, monsSize](const UnitAny &unit) {
-            if (unit.mode == 0 || unit.mode == 12 || unit.txtFileNo >= monsSize) { return; }
-            MonsterData monData;
-            if (!READ(unit.unionPtr, monData)) { return; }
-            auto isUnique = (monData.flag & 0x0E) != 0;
-            auto &txtData = gamedata->monsters[unit.txtFileNo];
-            auto isNpc = std::get<1>(txtData);
-            auto sm = cfg->showMonsters;
-            if (!isNpc && !(sm == 2 || (isUnique && sm == 1))) { return; }
-            DynamicPath path;
-            if (!READ(unit.pathPtr, path)) { return; }
-            auto &mon = mapMonsters_.emplace_back();
-            mon.x = path.posX;
-            mon.y = path.posY;
-            mon.isNpc = isNpc;
-            mon.isUnique = isUnique;
-            mon.flag = monData.flag;
-            if (isNpc) {
-                if (cfg->showNpcNames) {
-                    mon.name = std::get<2>(txtData);
-                    return;
-                }
-            } else if (auto sn = cfg->showMonsterNames; (sn == 2 || (isUnique && sn == 1))) {
-                /* Super unique */
-                if ((monData.flag & 2) && monData.uniqueNo < gamedata->superUniques.size()) {
-                    mon.name = gamedata->superUniques[monData.uniqueNo].second;
-                } else {
-                    mon.name = std::get<2>(txtData);
-                }
-            }
-            int off = 0;
-            bool hasAura = false;
-            if (auto sme = cfg->showMonsterEnchants; sme == 2 || (isUnique && sme == 1)) {
-                uint8_t id;
-                for (int n = 0; n < 9 && (id = monData.enchants[n]) != 0; ++n) {
-                    if (id == 30) {
-                        hasAura = true;
-                        continue;
-                    }
-                    const auto *str = enchantStrings[id];
-                    while (*str) {
-                        mon.enchants[off++] = *str++;
-                    }
-                }
-            }
-            auto smi = cfg->showMonsterImmunities;
-            bool showMI = smi == 2 || (isUnique && smi == 1);
-            if (!showMI && !hasAura) {
-                mon.enchants[off] = 0;
-                return;
-            }
-            readStateList(unit.statListPtr, unit.unitId, [this, &off, &mon, hasAura, showMI](const StatList &stats) {
-                if (stats.stateNo) {
-                    if (!hasAura) { return; }
-                    const wchar_t *str = auraStrings[stats.stateNo];
-                    while (*str) {
-                        mon.enchants[off++] = *str++;
-                    }
-                    return;
-                }
-                if (!showMI) { return; }
-                static StatEx statEx[64];
-                auto cnt = std::min(64u, uint32_t(stats.stat.statCount));
-                if (!readMemory64(handle_, stats.stat.statPtr, sizeof(StatEx) * cnt, statEx)) { return; }
-                StatEx *st = statEx;
-                for (; cnt; --cnt, ++st) {
-                    if (st->value < 100) { continue; }
-                    auto statId = st->stateId;
-                    if (statId >= uint16_t(StatId::TotalCount)) { continue; }
-                    auto mapping = statsMapping[statId];
-                    if (!mapping) { continue; }
-                    const wchar_t *str = immunityStrings[mapping];
-                    while (*str) {
-                        mon.enchants[off++] = *str++;
-                    }
-                }
-            });
-            mon.enchants[off] = 0;
+        readUnitHashTable(currProcess->hashTableBaseAddr + 8 * 0x80, [this](const auto &unit) {
+            readUnit(unit);
         });
     }
     if (cfg->showObjects) {
-        if (currPlayer->levelChanged) {
-            mapObjects_.clear();
-        }
-        readUnitHashTable(baseAddr_ + HashTableBase + 8 * 0x100, [this](const UnitAny &unit) {
-            if (/* Portals */ unit.txtFileNo != 59 && unit.txtFileNo != 60 && /* destroyed/opened */ unit.mode == 2) {
-                StaticPath path;
-                if (READ(unit.pathPtr, path)) {
-                    mapObjects_.erase(path.posX | (uint32_t(path.posY) << 16));
-                }
-                return;
-            }
-            auto ite = gamedata->objects[0].find(unit.txtFileNo);
-            if (ite == gamedata->objects[0].end()) { return; }
-            auto type = std::get<0>(ite->second);
-            switch (type) {
-            case TypePortal:
-            case TypeWell:
-            case TypeShrine: {
-                uint8_t flag;
-                READ(unit.unionPtr + 8, flag);
-                StaticPath path;
-                if (!READ(unit.pathPtr, path)) { break; }
-                auto &obj = mapObjects_[path.posX | (uint32_t(path.posY) << 16)];
-                if (obj.x) { break; }
-                obj.type = std::get<0>(ite->second);
-                obj.name = type == TypeShrine && flag < gamedata->shrines.size() ?
-                    gamedata->shrines[flag].second : std::get<2>(ite->second);
-                obj.x = path.posX;
-                obj.y = path.posY;
-                obj.flag = flag;
-                obj.w = std::get<3>(ite->second) * .5f;
-                obj.h = std::get<4>(ite->second) * .5f;
-                break;
-            }
-            default:
-                break;
-            }
+        readUnitHashTable(currProcess->hashTableBaseAddr + 8 * 0x100, [this](const auto &unit) {
+            readUnit(unit);
         });
     }
     if (cfg->showItems) {
-        mapItems_.clear();
-        readUnitHashTable(baseAddr_ + HashTableBase + 8 * 0x200, [this](const UnitAny &unit) {
-            ItemData item;
-            if (!unit.actPtr /* ground items has pAct set */
-                || !READ(unit.unionPtr, item)
-                || item.ownerInvPtr || item.location != 0
-                || (item.itemFlags & 0x01) /* InStore */)
-                { return; }
-            /* the item is on the ground */
-            uint32_t sockets = 0;
-            if (item.itemFlags & 0x800u) {
-                readStateList(unit.statListPtr, unit.unitId, [this, &sockets](const StatList &stats) {
-                    if (stats.stateNo) { return; }
-                    static StatEx statEx[64];
-                    auto cnt = std::min(64u, uint32_t(stats.stat.statCount));
-                    if (!readMemory64(handle_, stats.stat.statPtr, sizeof(StatEx) * cnt, statEx)) { return; }
-                    StatEx *st = statEx;
-                    for (; cnt; --cnt, ++st) {
-                        if (st->stateId != uint16_t(StatId::ItemNumsockets)) { continue; }
-                        sockets = st->value;
-                        break;
-                    }
-                });
-            }
-            auto n = filterItem(&unit, &item, sockets);
-            if (!n) { return; }
-            StaticPath path;
-            if (!READ(unit.pathPtr, path)) { return; }
-            auto &mitem = mapItems_.emplace_back();
-            mitem.x = path.posX;
-            mitem.y = path.posY;
-            mitem.name = unit.txtFileNo < gamedata->items.size() ? gamedata->items[unit.txtFileNo].second : nullptr;
-            mitem.flag = n & 0x0F;
-            auto color = n >> 4;
-            if (color == 0) {
-                if (auto quality = uint32_t(item.quality - 1); quality < 8) {
-                    const uint8_t qualityColors[8] = {15, 15, 5, 3, 2, 9, 4, 8};
-                    color = qualityColors[quality];
-                }
-            }
-            mitem.color = color;
+        readUnitHashTable(currProcess->hashTableBaseAddr + 8 * 0x200, [this](const auto &unit) {
+            readUnit(unit);
         });
     }
 }
@@ -670,7 +582,9 @@ void onSizeChange(HWND hwnd) {
 
 void D2RProcess::setWindowPosCallback(const std::function<void(int, int, int, int)> &cb) {
     sizeCallback = cb;
-    onSizeChange((HWND)hwnd_);
+    if (currProcess_) {
+        onSizeChange((HWND)currProcess_->hwnd);
+    }
 }
 
 VOID CALLBACK hookCb(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject, LONG idChild,
@@ -678,73 +592,89 @@ VOID CALLBACK hookCb(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG i
     onSizeChange(hwnd);
 }
 
-void D2RProcess::searchForProcess() {
-    PROCESSENTRY32W entry;
-    entry.dwSize = sizeof(PROCESSENTRY32W);
-
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-
-    DWORD processId = 0;
-
-    if (Process32FirstW(snapshot, &entry) == TRUE) {
-        while (Process32NextW(snapshot, &entry) == TRUE) {
-            if (StrCmpIW(entry.szExeFile, L"D2R.exe") == 0) {
-                handle_ = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION | SYNCHRONIZE, FALSE, entry.th32ProcessID);
-                if (!handle_) { break; }
-                Sleep(1000);
-                getModulesViaPEB(handle_, [this](uint64_t addr, uint64_t size, const wchar_t *name) {
-                    if (StrCmpIW(name, L"D2R.exe") != 0) {
-                        return true;
-                    }
-                    baseAddr_ = addr;
-                    baseSize_ = size;
-                    return false;
-                });
-                if (baseSize_) {
-                    hwnd_ = findMainWindow(entry.th32ProcessID);
-                    processId = entry.th32ProcessID;
-                } else {
-                    resetData();
-                }
-                break;
-            }
-        }
+void D2RProcess::searchForProcess(void *hwnd) {
+    if (!hwnd) { currProcess_ = nullptr; return; }
+    auto ite = processes_.find(hwnd);
+    if (ite != processes_.end()) {
+        currProcess_ = &ite->second;
+        onSizeChange(HWND(currProcess_->hwnd));
+        return;
     }
-    CloseHandle(snapshot);
-    if (!handle_) { return; }
-    hook_ = SetWinEventHook(EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND, nullptr, hookCb, processId, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    onSizeChange(HWND(hwnd_));
+    DWORD processId = 0;
+    if (!GetWindowThreadProcessId((HWND)hwnd, &processId)) { return; }
+    HANDLE handle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION | SYNCHRONIZE, FALSE, processId);
+    if (!handle) { return; }
+    wchar_t fullpath[MAX_PATH];
+    if (!GetProcessImageFileNameW(handle, fullpath, MAX_PATH)) { CloseHandle(handle); return; }
+    if (StrCmpIW(PathFindFileNameW(fullpath), L"D2R.exe") != 0) { CloseHandle(handle); return; }
+    Sleep(1000);
+    uint64_t baseAddr, baseSize = 0;
+    getModules(handle, [&baseAddr, &baseSize](uint64_t addr, uint64_t size, const wchar_t *name) {
+        if (StrCmpIW(name, L"D2R.exe") != 0) {
+            return true;
+        }
+        baseAddr = addr;
+        baseSize = size;
+        return false;
+    });
+    if (!baseSize) {
+        CloseHandle(handle);
+        return;
+    }
+    auto &procInfo = processes_[(void*)hwnd];
+    procInfo.handle = handle;
+    procInfo.hwnd = hwnd;
+    procInfo.baseAddr = baseAddr;
+    procInfo.baseSize = baseSize;
+
+    currProcess_ = &procInfo;
+    procInfo.hook = SetWinEventHook(EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND, nullptr, hookCb, processId, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    onSizeChange(HWND(procInfo.hwnd));
+    updateOffset();
     updateData();
 }
 
-void D2RProcess::resetData() {
-    if (handle_) {
-        UnhookWinEvent(HWINEVENTHOOK(hook_));
-        hook_ = nullptr;
-        CloseHandle(handle_);
-        handle_ = nullptr;
+void D2RProcess::updateOffset() {
+    auto *currProcess = currProcess_;
+    auto *mem = new(std::nothrow) uint8_t[size_t(currProcess->baseSize)];
+    if (mem && readMemory64(currProcess->handle, currProcess->baseAddr, uint32_t(currProcess->baseSize), mem)) {
+        const uint8_t search0[] = {0x48, 0x8D, 0, 0, 0, 0, 0, 0x8B, 0xD1};
+        const uint8_t mask0[] = {0xFF, 0xFF, 0, 0, 0, 0, 0, 0xFF, 0xFF};
+        auto off = searchMem(mem, size_t(currProcess->baseSize), search0, mask0, sizeof(search0));
+        if (off != size_t(-1)) {
+            int32_t rel;
+            if (READ(currProcess->baseAddr + off + 3, rel)) {
+                currProcess->hashTableBaseAddr = currProcess->baseAddr + off + 7 + rel;
+            }
+        }
+
+        const uint8_t search1[] = {0x40, 0x84, 0xED, 0x0F, 0x94, 0x05};
+        const uint8_t mask1[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        off = searchMem(mem, size_t(currProcess->baseSize), search1, mask1, sizeof(search1));
+        if (off != size_t(-1)) {
+            int32_t rel;
+            if (READ(currProcess->baseAddr + off + 6, rel)) {
+                currProcess->uiBaseAddr = currProcess->baseAddr + off + 10 + rel - 0x12;
+            }
+        }
+        const uint8_t search2[] = {0xC7, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x85, 0xC0, 0x0F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x83, 0x78, 0x5C, 0x00, 0x0F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x33, 0xD2, 0x41};
+        const uint8_t mask2[] = {0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF};
+        off = searchMem(mem, size_t(currProcess->baseSize), search2, mask2, sizeof(search2));
+        if (off != size_t(-1)) {
+            int32_t rel;
+            if (READ(currProcess->baseAddr + off - 4, rel)) {
+                currProcess->isExpansionAddr = currProcess->baseAddr + off + rel;
+            }
+        }
     }
-    available_ = false;
-
-    hwnd_ = nullptr;
-
-    baseAddr_ = 0;
-    baseSize_ = 0;
-
-    mapEnabled_ = 0;
-    focusedPlayer_ = 0;
-    currPlayer_ = nullptr;
-
-    mapPlayers_.clear();
-    mapMonsters_.clear();
-    mapObjects_.clear();
-    mapItems_.clear();
+    delete[] mem;
 }
 
 void D2RProcess::readUnitHashTable(uint64_t addr, const std::function<void(const UnitAny&)> &callback) {
-    for (int i = 0; i < 0x80; ++i) {
-        uint64_t paddr;
-        if (!READ(addr, paddr)) { return; }
+    auto *currProcess = currProcess_;
+    uint64_t addrList[0x80];
+    if (!READ(addr, addrList)) { return; }
+    for (auto paddr: addrList) {
         while (paddr) {
             UnitAny unit;
             if (READ(paddr, unit)) {
@@ -752,10 +682,10 @@ void D2RProcess::readUnitHashTable(uint64_t addr, const std::function<void(const
             }
             paddr = unit.nextPtr;
         }
-        addr += 8;
     }
 }
 void D2RProcess::readStateList(uint64_t addr, uint32_t unitId, const std::function<void(const StatList &)> &callback) {
+    auto *currProcess = currProcess_;
     StatList stats;
     if (!READ(addr, stats)) { return; }
     do {
@@ -766,4 +696,313 @@ void D2RProcess::readStateList(uint64_t addr, uint32_t unitId, const std::functi
         if (!(stats.flag & 0x80000000u)) { break; }
         if (!stats.nextListEx || !READ(stats.nextListEx, stats)) { break; }
     } while (true);
+}
+
+void D2RProcess::readRoomUnits(const DrlgRoom1 &room1, std::unordered_set<uint64_t> &roomList) {
+    auto *currProcess = currProcess_;
+    DrlgRoom2 room2;
+    READ(room1.room2Ptr, room2);
+    uint64_t roomsNear[64];
+    uint64_t addr = room1.unitFirstAddr;
+    while (addr) {
+        UnitAny unit;
+        if (!READ(addr, unit)) { break; }
+        readUnit(unit);
+        addr = unit.roomNextPtr;
+    }
+    auto count = std::min(64u, room1.roomsNear);
+    if (readMemory64(currProcess_->handle, room1.roomsNearListPtr, count * sizeof(uint64_t), roomsNear)) {
+        auto *currProcess = currProcess_;
+        for (auto i = 0u; i < count; ++i) {
+            auto addr = roomsNear[i];
+            if (roomList.find(addr) != roomList.end()) { continue; }
+            DrlgRoom1 room;
+            if (!READ(addr, room)) { continue; }
+            roomList.insert(addr);
+            readRoomUnits(room, roomList);
+        }
+    }
+}
+
+void D2RProcess::readUnit(const UnitAny &unit) {
+    switch (unit.unitType) {
+    case 0:
+        readUnitPlayer(unit);
+        break;
+    case 1:
+        if (cfg->showMonsters) { readUnitMonster(unit); }
+        break;
+    case 2:
+        if (cfg->showObjects) { readUnitObject(unit); }
+        break;
+    case 4:
+        if (cfg->showItems) { readUnitItem(unit); }
+        break;
+    }
+}
+void D2RProcess::readUnitPlayer(const UnitAny &unit) {
+    auto *currProcess = currProcess_;
+    if (unit.unitId == currProcess->focusedPlayer) { return; }
+    DrlgAct act;
+    if (!READ(unit.actPtr, act)) { return; }
+    auto &player = currProcess->mapPlayers[unit.unitId];
+    player.name[0] = 0;
+    READ(unit.unionPtr, player.name);
+    player.levelChanged = false;
+    player.act = act.actId;
+    player.seed = act.seed;
+    READ(act.miscPtr + 0x830, player.difficulty);
+    DynamicPath path;
+    if (!READ(unit.pathPtr, path)) { return; }
+    player.posX = path.posX;
+    player.posY = path.posY;
+    DrlgRoom1 room1;
+    if (!READ(path.room1Ptr, room1)) { return; }
+    DrlgRoom2 room2;
+    if (!READ(room1.room2Ptr, room2)) { return; }
+    if (!READ(room2.levelPtr + 0x1F8, player.levelId)) { return; }
+}
+void D2RProcess::readUnitMonster(const UnitAny &unit) {
+    if (unit.mode == 0 || unit.mode == 12 || unit.txtFileNo >= gamedata->monsters.size()) { return; }
+    auto *currProcess = currProcess_;
+    MonsterData monData;
+    if (!READ(unit.unionPtr, monData)) { return; }
+    auto isUnique = (monData.flag & 0x0E) != 0;
+    auto &txtData = gamedata->monsters[unit.txtFileNo];
+    auto isNpc = std::get<1>(txtData);
+    auto sm = cfg->showMonsters;
+    if (!isNpc && !(sm == 2 || (isUnique && sm == 1))) { return; }
+    DynamicPath path;
+    if (!READ(unit.pathPtr, path)) { return; }
+    auto &mon = currProcess->mapMonsters.emplace_back();
+    mon.x = path.posX;
+    mon.y = path.posY;
+    mon.isNpc = isNpc;
+    mon.isUnique = isUnique;
+    mon.flag = monData.flag;
+    if (isNpc) {
+        if (cfg->showNpcNames) {
+            if (monData.mercNameId == uint16_t(-1) || monData.mercNameId >= gamedata->mercNames.size()) {
+                /* show only npcs' name, hide summons' name */
+                if (isNpc == 1) { mon.name = std::get<2>(txtData); }
+            } else {
+                mon.name = gamedata->mercNames[monData.mercNameId].second;
+            }
+        }
+        return;
+    } else if (auto sn = cfg->showMonsterNames; (sn == 2 || (isUnique && sn == 1))) {
+        /* Super unique */
+        if ((monData.flag & 2) && monData.uniqueNo < gamedata->superUniques.size()) {
+            mon.name = gamedata->superUniques[monData.uniqueNo].second;
+        } else {
+            mon.name = std::get<2>(txtData);
+        }
+    }
+    int off = 0;
+    bool hasAura = false;
+    if (auto sme = cfg->showMonsterEnchants; sme == 2 || (isUnique && sme == 1)) {
+        uint8_t id;
+        for (int n = 0; n < 9 && (id = monData.enchants[n]) != 0; ++n) {
+            if (id == 30) {
+                hasAura = true;
+                continue;
+            }
+            const auto *str = enchantStrings[id];
+            while (*str) {
+                mon.enchants[off++] = *str++;
+            }
+        }
+    }
+    auto smi = cfg->showMonsterImmunities;
+    bool showMI = smi == 2 || (isUnique && smi == 1);
+    if (!showMI && !hasAura) {
+        mon.enchants[off] = 0;
+        return;
+    }
+    readStateList(unit.statListPtr, unit.unitId, [this, &off, &mon, hasAura, showMI](const StatList &stats) {
+        if (stats.stateNo) {
+            if (!hasAura) { return; }
+            const wchar_t *str = auraStrings[stats.stateNo];
+            while (*str) {
+                mon.enchants[off++] = *str++;
+            }
+            return;
+        }
+        if (!showMI) { return; }
+        auto *currProcess = currProcess_;
+        static StatEx statEx[64];
+        auto cnt = std::min(64u, uint32_t(stats.stat.statCount));
+        if (!readMemory64(currProcess->handle, stats.stat.statPtr, sizeof(StatEx) * cnt, statEx)) { return; }
+        StatEx *st = statEx;
+        for (; cnt; --cnt, ++st) {
+            if (st->value < 100) { continue; }
+            auto statId = st->stateId;
+            if (statId >= uint16_t(StatId::TotalCount)) { continue; }
+            auto mapping = statsMapping[statId];
+            if (!mapping) { continue; }
+            const wchar_t *str = immunityStrings[mapping];
+            while (*str) {
+                mon.enchants[off++] = *str++;
+            }
+        }
+    });
+    mon.enchants[off] = 0;
+}
+
+void D2RProcess::readUnitObject(const UnitAny &unit) {
+    auto *currProcess = currProcess_;
+    if (/* Portals */ unit.txtFileNo != 59 && unit.txtFileNo != 60 && /* destroyed/opened */ unit.mode == 2) {
+        StaticPath path;
+        if (READ(unit.pathPtr, path)) {
+            currProcess->mapObjects.erase(path.posX | (uint32_t(path.posY) << 16));
+        }
+        return;
+    }
+    auto ite = gamedata->objects[0].find(unit.txtFileNo);
+    if (ite == gamedata->objects[0].end()) { return; }
+    auto type = std::get<0>(ite->second);
+    switch (type) {
+    case TypePortal:
+    case TypeWell:
+    case TypeShrine: {
+        uint8_t flag;
+        READ(unit.unionPtr + 8, flag);
+        StaticPath path;
+        if (!READ(unit.pathPtr, path)) { break; }
+        auto &obj = currProcess->mapObjects[path.posX | (uint32_t(path.posY) << 16)];
+        if (obj.x) { break; }
+        obj.type = std::get<0>(ite->second);
+        obj.name = type == TypeShrine && flag < gamedata->shrines.size() ?
+                   gamedata->shrines[flag].second : std::get<2>(ite->second);
+        obj.x = path.posX;
+        obj.y = path.posY;
+        obj.flag = flag;
+        obj.w = std::get<3>(ite->second) * .5f;
+        obj.h = std::get<4>(ite->second) * .5f;
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void D2RProcess::readUnitItem(const UnitAny &unit) {
+    auto *currProcess = currProcess_;
+    ItemData item;
+    if (!unit.actPtr /* ground items has pAct set */
+        || !READ(unit.unionPtr, item)
+        || item.ownerInvPtr || item.location != 0
+        || (item.itemFlags & 0x01) /* InStore */)
+    { return; }
+    /* the item is on the ground */
+    uint32_t sockets = 0;
+    if (item.itemFlags & 0x800u) {
+        readStateList(unit.statListPtr, unit.unitId, [this, &sockets](const StatList &stats) {
+            if (stats.stateNo) { return; }
+            auto *currProcess = currProcess_;
+            static StatEx statEx[64];
+            auto cnt = std::min(64u, uint32_t(stats.stat.statCount));
+            if (!readMemory64(currProcess->handle, stats.stat.statPtr, sizeof(StatEx) * cnt, statEx)) { return; }
+            StatEx *st = statEx;
+            for (; cnt; --cnt, ++st) {
+                if (st->stateId != uint16_t(StatId::ItemNumsockets)) { continue; }
+                sockets = st->value;
+                break;
+            }
+        });
+    }
+    auto n = filterItem(&unit, &item, sockets);
+    if (!n) { return; }
+    StaticPath path;
+    if (!READ(unit.pathPtr, path)) { return; }
+    auto &mitem = currProcess->mapItems.emplace_back();
+    mitem.x = path.posX;
+    mitem.y = path.posY;
+    mitem.name = unit.txtFileNo < gamedata->items.size() ? gamedata->items[unit.txtFileNo].second : nullptr;
+    mitem.flag = n & 0x0F;
+    auto color = (n >> 4) & 0x0F;
+    if (color == 0) {
+        if (auto quality = uint32_t(item.quality - 1); quality < 8) {
+            const uint8_t qualityColors[8] = {15, 15, 5, 3, 2, 9, 4, 8};
+            color = qualityColors[quality];
+        }
+    }
+    mitem.color = color;
+    auto snd = size_t(n >> 8);
+    if (snd > 0 && currProcess->knownItems.find(unit.unitId) == currProcess->knownItems.end()) {
+        currProcess->knownItems.insert(unit.unitId);
+        if (snd < cfg->sounds.size() && !cfg->sounds[snd].first.empty()) {
+            if (cfg->sounds[snd].second) {
+                PlaySoundW(cfg->sounds[snd].first.c_str(), nullptr, SND_ALIAS | SND_ASYNC | SND_NODEFAULT);
+            } else {
+                PlaySoundW(cfg->sounds[snd].first.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
+            }
+        }
+    }
+}
+void D2RProcess::loadFromCfg() {
+    loadEncText(enchantStrings[5], cfg->encTxtExtraStrong);
+    loadEncText(enchantStrings[6], cfg->encTxtExtraFast);
+    loadEncText(enchantStrings[7], cfg->encTxtCursed);
+    loadEncText(enchantStrings[8], cfg->encTxtMagicResistant);
+    loadEncText(enchantStrings[9], cfg->encTxtFireEnchanted);
+    loadEncText(enchantStrings[17], cfg->encTxtLigntningEnchanted);
+    loadEncText(enchantStrings[18], cfg->encTxtColdEnchanted);
+    loadEncText(enchantStrings[25], cfg->encTxtManaBurn);
+    loadEncText(enchantStrings[26], cfg->encTxtTeleportation);
+    loadEncText(enchantStrings[27], cfg->encTxtSpectralHit);
+    loadEncText(enchantStrings[28], cfg->encTxtStoneSkin);
+    loadEncText(enchantStrings[29], cfg->encTxtMultipleShots);
+    loadEncText(enchantStrings[37], cfg->encTxtFanatic);
+    loadEncText(enchantStrings[39], cfg->encTxtBerserker);
+
+    loadEncText(auraStrings[33], cfg->MightAura);
+    loadEncText(auraStrings[35], cfg->HolyFireAura);
+    loadEncText(auraStrings[40], cfg->BlessedAimAura);
+    loadEncText(auraStrings[43], cfg->HolyFreezeAura);
+    loadEncText(auraStrings[46], cfg->HolyShockAura);
+    loadEncText(auraStrings[28], cfg->ConvictionAura);
+    loadEncText(auraStrings[49], cfg->FanaticismAura);
+
+    loadEncText(immunityStrings[0], cfg->encTxtPhysicalImmunity);
+    loadEncText(immunityStrings[1], cfg->encTxtMagicImmunity);
+    loadEncText(immunityStrings[2], cfg->encTxtFireImmunity);
+    loadEncText(immunityStrings[3], cfg->encTxtLightningImmunity);
+    loadEncText(immunityStrings[4], cfg->encTxtColdImmunity);
+    loadEncText(immunityStrings[5], cfg->encTxtPoisonImmunity);
+}
+
+D2RProcess::ProcessData::ProcessData():
+    mapObjects(1024) {
+    mapMonsters.reserve(1024);
+    mapItems.reserve(1024);
+}
+D2RProcess::ProcessData::~ProcessData() {
+    if (handle) {
+        UnhookWinEvent(HWINEVENTHOOK(hook));
+        hook = nullptr;
+        CloseHandle(handle);
+    }
+}
+void D2RProcess::ProcessData::resetData() {
+    if (handle) {
+        UnhookWinEvent(HWINEVENTHOOK(hook));
+        hook = nullptr;
+        CloseHandle(handle);
+        handle = nullptr;
+    }
+
+    hwnd = nullptr;
+
+    baseAddr = 0;
+    baseSize = 0;
+
+    mapEnabled = 0;
+    focusedPlayer = 0;
+    currPlayer = nullptr;
+
+    mapPlayers.clear();
+    mapMonsters.clear();
+    mapObjects.clear();
+    mapItems.clear();
 }

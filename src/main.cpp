@@ -12,11 +12,13 @@
 #include "window.h"
 #include "maprenderer.h"
 #include "util.h"
+#include "os_structs.h"
 
 #include "d2map.h"
 
 int WINAPI WinMain(HINSTANCE hinstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, L"Global\\D2RMH_EVENT" );
+    osInit();
+    HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, L"Global\\D2RMH_EVENT");
     if (!evt) {
         return -1;
     }
@@ -26,31 +28,14 @@ int WINAPI WinMain(HINSTANCE hinstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 0;
     }
     loadCfg();
-    const auto *errstr = d2MapInit(cfg->d2Path.c_str());
-    if (errstr) {
-        do {
-            HKEY key;
-            if (RegOpenKeyExW(HKEY_CURRENT_USER, L"SOFTWARE\\Blizzard Entertainment\\Diablo II", 0, KEY_READ, &key) == ERROR_SUCCESS) {
-                wchar_t path[MAX_PATH];
-                DWORD pathSize = sizeof(path);
-                if (RegQueryValueExW(key, L"InstallPath", nullptr, nullptr, LPBYTE(path), &pathSize) == ERROR_SUCCESS) {
-                    errstr = d2MapInit(path);
-                    if (!errstr) {
-                        RegCloseKey(key);
-                        break;
-                    }
-                }
-                RegCloseKey(key);
-            }
-            MessageBoxA(nullptr, errstr, "D2RMH", MB_OK | MB_ICONERROR);
-            return 0;
-        } while (false);
+    d2mapapi::PipedChildProcess pcp;
+    if (!pcp.start(L"d2mapapi_piped.exe", (wchar_t *)cfg->d2Path.c_str())) {
+        MessageBoxA(nullptr, pcp.errMsg().c_str(), nullptr, 0);
+        return -1;
     }
     loadData();
 
     Window wnd(100, 100, 500, 400);
-    wnd.enableTrayMenu(true, (const wchar_t*)1, L"D2RMH", L"D2RMH is running.\nYou can close it from tray-icon popup menu.", L"D2RMH");
-    wnd.addTrayMenuItem(L"Quit", -1, 0, [&wnd]() { wnd.quit(); });
     Renderer renderer(&wnd);
     if (cfg->fps > 0) {
         renderer.limitFPS(cfg->fps);
@@ -58,8 +43,26 @@ int WINAPI WinMain(HINSTANCE hinstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         Renderer::setSwapInterval(-cfg->fps);
     }
 
-    MapRenderer map(renderer);
+    MapRenderer map(renderer, pcp);
+    wnd.enableTrayMenu(true,
+                       (const wchar_t *)1,
+                       L"D2RMH " VERSION_STRING_FULL,
+                       L"D2RMH is running.\nYou can close it from tray-icon popup menu.",
+                       L"D2RMH " VERSION_STRING);
+    wnd.addAboutMenu();
+    wnd.addTrayMenuItem(L"Reload Config", -1, 0, [&wnd, &renderer, &map]() {
+        loadCfg();
+        wnd.reloadConfig();
+        if (cfg->fps > 0) {
+            renderer.limitFPS(cfg->fps);
+        } else {
+            Renderer::setSwapInterval(-cfg->fps);
+        }
+        map.reloadConfig();
+    });
+    wnd.addTrayMenuItem(L"Quit", -1, 0, [&wnd]() { wnd.quit(); });
     while (wnd.run()) {
+        updateTime();
         renderer.prepare();
         map.update();
         renderer.begin();

@@ -25,7 +25,9 @@ public:
     ~Window();
 
     void enableTrayMenu(bool enable, const wchar_t *icon, const wchar_t *tip = nullptr, const wchar_t *info = nullptr, const wchar_t *infoTitle = nullptr);
+    void addAboutMenu();
     int addTrayMenuItem(const wchar_t *name, int parent, unsigned flags, const std::function<void()> &cb);
+    void destroyTrayMenu();
 
     [[nodiscard]] bool run() const;
     [[nodiscard]] bool running() const;
@@ -34,6 +36,8 @@ public:
     [[nodiscard]] inline WindowCtx *ctx() { return ctx_; }
     void getDimension(int &w, int &h);
     void move(int x, int y, int w, int h);
+
+    void reloadConfig();
 
 private:
     void setSizeCallback(const std::function<void(int, int)> &cb);

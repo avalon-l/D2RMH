@@ -137,7 +137,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    JsonLng jlng;
+    JsonLng jlng, jlngMerc;
     loadJsonLng(jlng, storage, "data:data/local/lng/strings/item-names.json");
     loadJsonLng(jlng, storage, "data:data/local/lng/strings/item-runes.json");
     loadJsonLng(jlng, storage, "data:data/local/lng/strings/item-nameaffixes.json");
@@ -148,6 +148,7 @@ int main(int argc, char *argv[]) {
     loadJsonLng(jlng, storage, "data:data/local/lng/strings/objects.json");
     loadJsonLng(jlng, storage, "data:data/local/lng/strings/shrines.json");
     loadJsonLng(jlng, storage, "data:data/local/lng/strings/ui.json");
+    loadJsonLng(jlngMerc, storage, "data:data/local/lng/strings/mercenaries.json");
     jlng.remove("dummy");
     jlng.remove("Dummy");
     jlng.remove("unused");
@@ -166,6 +167,13 @@ int main(int argc, char *argv[]) {
 
     std::map<std::string, std::array<std::string, JsonLng::LNG_MAX>> strings;
     std::map<std::string, int> levelIdByName;
+
+    for (const auto *s: {"strCreateGameNormalText", "strCreateGameNightmareText", "strCreateGameHellText"}) {
+        const auto *arr = jlng.get(s);
+        if (arr) {
+            strings[s] = *arr;
+        }
+    }
 
     std::ofstream ofs("D2RMH_data.ini");
     std::ofstream ofs2("ItemDesc.csv");
@@ -230,6 +238,9 @@ int main(int argc, char *argv[]) {
     idx0 = monTxt.colIndexByName("*hcIdx");
     idx1 = monTxt.colIndexByName("NameStr");
     idx2 = monTxt.colIndexByName("npc");
+    idx3 = monTxt.colIndexByName("Align");
+    idx4 = monTxt.colIndexByName("inTown");
+    idx5 = monTxt.colIndexByName("enabled");
     ofs << std::endl << '[' << "npcs" << ']' << std::endl;
     rows = monTxt.rows();
     for (size_t i = 0; i < rows; ++i) {
@@ -249,13 +260,14 @@ int main(int argc, char *argv[]) {
 
     ofs << std::endl << '[' << "monsters" << ']' << std::endl;
     for (size_t i = 0; i < rows; ++i) {
+        if (!monTxt.value(i, idx5).second) { continue; }
         auto id = monTxt.value(i, idx0).second;
         auto key = monTxt.value(i, idx1).first;
         const auto *arr = jlng.get(key);
         if (arr) {
             strings[key] = *arr;
-            ofs << id << '=' << key << '|' << monTxt.value(i, idx2).second << std::endl;
         }
+        ofs << id << '=' << (arr ? key : "") << '|' << (monTxt.value(i, idx2).second ? 1 : monTxt.value(i, idx3).second ? 2 : monTxt.value(i, idx4).second ? 1 : 0) << std::endl;
     }
 
     idx0 = shrineTxt.colIndexByName("Code");
@@ -313,6 +325,15 @@ int main(int argc, char *argv[]) {
             itemIndex++;
         }
     }
+
+    ofs << std::endl << '[' << "mercnames" << ']' << std::endl;
+    jlngMerc.iterateById([&ofs, &jlngMerc, &strings](uint32_t id, const std::string &key) {
+        const auto *arr = jlngMerc.get(key);
+        if (arr) {
+            strings[key] = *arr;
+            ofs << id << '=' << key << std::endl;
+        }
+    });
 
     ofs << std::endl << '[' << "strings" << ']' << std::endl;
     for (auto &p: strings) {
